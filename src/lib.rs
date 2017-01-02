@@ -1,23 +1,28 @@
-use std::old_io::IoResult;
+use std::mem::swap;
+use std::io::{Error, Read};
 
-/// A wrapper around any struct implementing the `Reader` trait, additionally
+/// A wrapper around any struct implementing the `Read` trait, additionally
 /// allowing for `peek` operations to be performed. Therefore, the
-/// `PeekableReader` struct also implements the `Reader` trait.
+/// `PeekableReader` struct also implements the `Read` trait.
 ///
 /// The primary invariant of the `PeekableReader` is that after calling the
 /// `peek` method, the next `read_byte` call will return the same result as
 /// the `peek` does. When the result is a byte (read off the wrapped reader),
 /// any read-type method of the `Reader` trait will include the byte as the
-/// first one. On the other hand, if the result is an `IoError`, the error
+/// first one. On the other hand, if the result is an `io::Error`, the error
 /// will be returned regardless of which read-type method of the `Reader` is
 /// invoked. Consecutive `peek`s before any read-type operation is used
-/// always return the same `IoResult`.
+/// always return the same `io::Result`.
+///
+/// When using peek_byte you will get a Result<u8, &Error>, while when you call
+/// any of the `Read` functions you will get an io::Result<u8>, thereby
+/// consuming the io::Error (if any.)
 pub struct PeekableReader<R> {
     inner: R,
-    peeked_result: Option<IoResult<u8>>,
+    peeked_result: Option<Result<u8, Error>>,
 }
 
-impl<R: Reader> PeekableReader<R> {
+impl<R: Read> PeekableReader<R> {
     /// Initializes a new `PeekableReader` which wraps the given underlying
     /// reader.
     pub fn new(reader: R) -> PeekableReader<R> {
@@ -27,43 +32,53 @@ impl<R: Reader> PeekableReader<R> {
         }
     }
 
-    /// Returns the `IoResult` which the Reader will return on the next
+    /// Returns the `io::Result` which the Reader will return on the next
     /// `get_byte` call.
     ///
-    /// If the `IoResult` is indeed an `IoError`, the error will be returned
-    /// for any subsequent read operation invoked upon the `Reader`.
-    pub fn peek_byte(&mut self) -> IoResult<u8> {
+    /// If the `io::Result` is indeed an `io::Error`, the error will be returned
+    /// for any subsequent read operation invoked upon the `Read`er.
+    pub fn peek_byte(&mut self) -> Result<u8, &Error> {
         // Return either the currently cached peeked byte or obtain a new one
         // from the underlying reader.
         match self.peeked_result {
-            Some(ref old_res) => old_res.clone(),
+            Some(Ok(x)) => Ok(x),
+            Some(Err(ref e)) => Err(e),
             None => {
                 // First get the result of the read from the underlying reader
-                self.peeked_result = Some(self.inner.read_byte());
+                let mut tmp: [u8; 1] = [0];
+                self.peeked_result = match self.inner.read_exact(&mut tmp) {
+                    Ok(()) => Some(Ok(tmp[0])),
+                    Err(e) => Some(Err(e)),
+                };
 
                 // Now just return that
-                self.peeked_result.clone().unwrap()
+                let tmp: Result<u8, &Error> = match self.peeked_result {
+                    Some(Ok(x)) => Ok(x),
+                    Some(Err(ref e)) => Err(e),
+                    None => unreachable!(),
+                };
+                tmp
             }
         }
     }
 }
 
-impl<R: Reader> Reader for PeekableReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+impl<R: Read> Read for PeekableReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         if buf.len() == 0 {
             return Ok(0);
         }
 
         // First, put the byte that was read off the underlying reader in a
         // (possible) previous peek operation (if such a byte is indeed cached)
-        let offset = match self.peeked_result.clone() {
+        let mut tmp = None;
+        swap(&mut tmp, &mut self.peeked_result);
+        let offset = match tmp {
             Some(Err(e)) => {
-                self.peeked_result = None;
                 return Err(e);
             },
             Some(Ok(b)) => {
                 buf[0] = b;
-                self.peeked_result = None;
                 1
             },
             None => 0,
